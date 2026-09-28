@@ -5,8 +5,7 @@ cd /d "%~dp0"
 REM 提交信息：双击用默认（带时间）；也可以命令行传：deploy.bat "我的更新说明"
 set "MSG=%~1"
 if "%MSG%"=="" (
-  for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm'"') do set "STAMP=%%i"
-  set "MSG=更新于 %STAMP%"
+  for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm'"') do set "MSG=更新于 %%i"
 )
 
 echo ===== 提交更改 =====
