@@ -2,9 +2,12 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 
-REM 提交信息：双击用默认（带时间）；也可以拖进来或命令行传：deploy.bat "我的更新说明"
+REM 提交信息：双击用默认（带时间）；也可以命令行传：deploy.bat "我的更新说明"
 set "MSG=%~1"
-if "%MSG%"=="" set "MSG=更新于 %date:~0,4%-%date:~5,2%-%date:~8,2% %time:~0,5%"
+if "%MSG%"=="" (
+  for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format 'yyyy-MM-dd HH:mm'"') do set "STAMP=%%i"
+  set "MSG=更新于 %STAMP%"
+)
 
 echo ===== 提交更改 =====
 git add .
