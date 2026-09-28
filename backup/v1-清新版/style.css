@@ -1,0 +1,121 @@
+/* ========== 全局样式 · 新海诚风格 ========== */
+
+:root {
+  /* 天空色系 */
+  --sky-deep: #2b6cb8;
+  --sky-mid: #63b3ed;
+  --sky-light: #bee3f8;
+  --horizon-pink: #fbd5e0;
+  --horizon-warm: #ffe8c9;
+  --sun-glow: #fff3b0;
+  --cloud-white: #ffffff;
+
+  /* 文字 */
+  --text-primary: #2d3748;
+  --text-secondary: #4a5568;
+  --text-faint: #718096;
+
+  /* 玻璃卡片 */
+  --glass-bg: rgba(255, 255, 255, 0.55);
+  --glass-border: rgba(255, 255, 255, 0.7);
+  --glass-shadow: 0 8px 32px rgba(43, 108, 184, 0.12);
+
+  --font-serif: 'Noto Serif SC', 'Source Han Serif SC', 'Songti SC', 'SimSun', serif;
+  --font-sans: 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--text-primary);
+  background: linear-gradient(
+    180deg,
+    var(--sky-deep) 0%,
+    var(--sky-mid) 35%,
+    var(--sky-light) 65%,
+    var(--horizon-warm) 100%
+  );
+  background-attachment: fixed;
+  min-height: 100vh;
+  line-height: 1.8;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+/* ========== 玻璃拟态卡片 ========== */
+.glass-card {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  box-shadow: var(--glass-shadow);
+  transition:
+    transform 0.35s ease,
+    box-shadow 0.35s ease;
+}
+
+.glass-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 16px 48px rgba(43, 108, 184, 0.2);
+}
+
+/* ========== 页面容器 ========== */
+.page-container {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 100px 24px 64px;
+  position: relative;
+  z-index: 1;
+}
+
+/* ========== 标题字体 ========== */
+.serif-title {
+  font-family: var(--font-serif);
+  letter-spacing: 0.08em;
+}
+
+/* ========== 标签 ========== */
+.tag {
+  display: inline-block;
+  padding: 2px 12px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  background: rgba(255, 255, 255, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.8);
+  color: var(--text-secondary);
+  margin-right: 6px;
+}
+
+/* ========== 淡入动画 ========== */
+.fade-enter-active {
+  transition: opacity 0.5s ease, transform 0.5s ease;
+}
+.fade-enter-from {
+  opacity: 0;
+  transform: translateY(16px);
+}
+
+/* ========== 滚动条 ========== */
+::-webkit-scrollbar {
+  width: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.5);
+  border-radius: 5px;
+}
