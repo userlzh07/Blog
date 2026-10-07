@@ -3,8 +3,8 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import MoonArchiveScene from '../components/MoonArchiveScene.vue'
 import { posts } from '../lib/posts'
 
-// 固定分类：全部 / 随笔 / 科研
-const CATEGORIES = ['全部', '随笔', '科研']
+// 固定分类：课程分类紧跟科研，方便在同一组入口中浏览
+const CATEGORIES = ['全部', '随笔', '科研', '课程']
 const activeTag = ref('全部')
 const archiveScrolled = ref(false)
 

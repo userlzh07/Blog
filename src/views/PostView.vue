@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { marked } from 'marked'
 import { getPost, posts } from '../lib/posts'
@@ -9,7 +9,83 @@ const props = defineProps({ slug: String })
 const router = useRouter()
 
 const post = computed(() => getPost(props.slug))
-const html = computed(() => (post.value ? marked.parse(post.value.body) : ''))
+const articleBody = ref(null)
+
+function prepareArticleHtml(body) {
+  if (typeof DOMParser === 'undefined') return marked.parse(body)
+  const parsed = new DOMParser().parseFromString(marked.parse(body), 'text/html')
+  for (const formula of parsed.querySelectorAll('.ztext-math')) {
+    const tex = formula.getAttribute('data-tex') || formula.querySelector('.math-holder')?.textContent?.trim()
+    if (!tex) continue
+
+    if (formula.querySelector('.MathJax_SVG')) {
+      formula.querySelectorAll('.MathJax_Preview, .math-holder').forEach((node) => node.remove())
+      continue
+    }
+
+    const replacement = parsed.createElement('span')
+    replacement.className = 'blog-tex-math'
+    replacement.dataset.tex = tex
+    replacement.textContent = `\\(${tex}\\)`
+    formula.replaceWith(replacement)
+  }
+  return parsed.body.innerHTML
+}
+
+const html = computed(() => (post.value ? prepareArticleHtml(post.value.body) : ''))
+
+let mathJaxPromise
+function loadMathJax() {
+  if (window.MathJax?.typesetPromise) return Promise.resolve(window.MathJax)
+  if (mathJaxPromise) return mathJaxPromise
+
+  window.MathJax = {
+    startup: { typeset: false },
+    tex: { inlineMath: [['\\(', '\\)']], displayMath: [['\\[', '\\]']] },
+    svg: { fontCache: 'global' },
+  }
+
+  mathJaxPromise = new Promise((resolve, reject) => {
+    const script = document.createElement('script')
+    script.src = 'https://cdn.jsdelivr.net/npm/mathjax@4.0.0/tex-svg.js'
+    script.async = true
+    script.onload = async () => {
+      try {
+        await window.MathJax.startup.promise
+        resolve(window.MathJax)
+      } catch (error) {
+        reject(error)
+      }
+    }
+    script.onerror = () => reject(new Error('MathJax failed to load'))
+    document.head.append(script)
+  })
+  return mathJaxPromise
+}
+
+async function typesetArticleMath() {
+  const root = articleBody.value
+  if (!root || !root.querySelector('.blog-tex-math')) return
+  try {
+    const mathJax = await loadMathJax()
+    await mathJax.typesetPromise([root])
+  } catch (error) {
+    root.querySelectorAll('.blog-tex-math').forEach((node) => {
+      node.textContent = node.dataset.tex || node.textContent
+    })
+    console.error('文章公式排版失败', error)
+  }
+}
+
+watch(
+  html,
+  () => {
+    const root = articleBody.value
+    if (root) window.MathJax?.typesetClear?.([root])
+    nextTick(typesetArticleMath)
+  },
+  { flush: 'pre' },
+)
 
 // 上一篇 / 下一篇
 const index = computed(() => posts.findIndex((p) => p.slug === props.slug))
@@ -22,8 +98,14 @@ if (!post.value) router.replace('/posts')
 
 marked.setOptions({ breaks: true })
 
-onMounted(() => document.body.classList.add('moon-page-active'))
-onUnmounted(() => document.body.classList.remove('moon-page-active'))
+onMounted(() => {
+  document.body.classList.add('moon-page-active')
+  typesetArticleMath()
+})
+onUnmounted(() => {
+  if (articleBody.value) window.MathJax?.typesetClear?.([articleBody.value])
+  document.body.classList.remove('moon-page-active')
+})
 </script>
 
 <template>
@@ -51,7 +133,7 @@ onUnmounted(() => document.body.classList.remove('moon-page-active'))
           </div>
         </header>
         <!-- eslint-disable-next-line vue/no-v-html -->
-        <div class="markdown-body" v-html="html"></div>
+        <div ref="articleBody" class="markdown-body" v-html="html"></div>
       </article>
 
       <nav class="post-nav">
@@ -299,5 +381,40 @@ onUnmounted(() => document.body.classList.remove('moon-page-active'))
 .markdown-body th {
   background: rgba(255, 255, 255, 0.08);
   font-weight: 600;
+}
+
+/* Zhihu stores three layers per rendered equation: SVG, assistive MathML,
+   and a raw TeX fallback. Keep the visual SVG once, while retaining the
+   MathML as screen-reader-only content. */
+.markdown-body .ztext-math:has(.MathJax_SVG) .MathJax_Preview,
+.markdown-body .ztext-math:has(.MathJax_SVG) .math-holder {
+  display: none !important;
+}
+
+.markdown-body .zhihu-math-definitions {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+.markdown-body .zhihu-math-definitions svg {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+.markdown-body .ztext-math:has(.MathJax_SVG) .MJX_Assistive_MathML {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
 }
 </style>
