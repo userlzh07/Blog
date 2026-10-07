@@ -159,11 +159,19 @@ const fireworkNight = computed(() => {
   return minutes >= sunset + 90 || minutes < sunrise - 30
 })
 
+const sceneElement = ref(null)
+const motionSvg = ref(null)
 const fireworkCanvas = ref(null)
 const fireworks = ref([])
+const retiredFireworkBounds = []
+const fireworkSceneVisible = ref(false)
 let fireworkFrame = 0
 let fireworkTimer = 0
 let fireworkMounted = false
+let fireworkVisibilityObserver = null
+let fireworkResizeObserver = null
+let fireworkWidth = 0
+let fireworkHeight = 0
 const fireworkColors = [
   ['#a9faff', '#41dfff', '#6388ff', '#ce78ff', '#fff3db'],
   ['#fff1c5', '#ffc56f', '#ff70bd', '#c376ff', '#68eaff'],
@@ -177,7 +185,7 @@ function range(min, max) {
 }
 
 function launchFirework(x, y, automatic = false) {
-  if (!fireworkNight.value || !fireworkCanvas.value) return
+  if (!fireworkNight.value || !fireworkSceneVisible.value || !fireworkCanvas.value) return
   const colors = fireworkColors[Math.floor(Math.random() * fireworkColors.length)]
   const startX = clamp(x, 30, 1890)
   const startY = clamp(y, 80, 1960)
@@ -210,7 +218,10 @@ function launchFirework(x, y, automatic = false) {
     automatic,
   })
   // Keep the composition lively without letting bursts pile up over the couple.
-  if (fireworks.value.length > 4) fireworks.value.shift()
+  if (fireworks.value.length > 4) {
+    const retired = fireworks.value.shift()
+    if (retired?.bounds) retiredFireworkBounds.push(retired.bounds)
+  }
   if (!fireworkFrame) fireworkFrame = requestAnimationFrame(drawFireworks)
 }
 
@@ -231,23 +242,56 @@ function sparkPoint(firework, spark, elapsed) {
   }
 }
 
+function includeFireworkPoint(bounds, x, y, padding) {
+  bounds.left = Math.min(bounds.left, x - padding)
+  bounds.top = Math.min(bounds.top, y - padding)
+  bounds.right = Math.max(bounds.right, x + padding)
+  bounds.bottom = Math.max(bounds.bottom, y + padding)
+}
+
+function finishFireworkBounds(bounds) {
+  if (!Number.isFinite(bounds.left)) return null
+  const left = clamp(Math.floor(bounds.left), 0, 1920)
+  const top = clamp(Math.floor(bounds.top), 0, 1980)
+  const right = clamp(Math.ceil(bounds.right), 0, 1920)
+  const bottom = clamp(Math.ceil(bounds.bottom), 0, 1980)
+  return { x: left, y: top, width: right - left, height: bottom - top }
+}
+
 function drawFireworks(now) {
   fireworkFrame = 0
   const canvas = fireworkCanvas.value
-  if (!canvas) return
-  const rect = canvas.getBoundingClientRect()
-  if (rect.width <= 0 || rect.height <= 0) return
+  if (!canvas || !fireworkSceneVisible.value || document.hidden) return
+  if (!fireworkWidth || !fireworkHeight) {
+    fireworkWidth = canvas.clientWidth
+    fireworkHeight = canvas.clientHeight
+  }
+  if (fireworkWidth <= 0 || fireworkHeight <= 0) return
   const dpr = Math.min(window.devicePixelRatio || 1, 2)
-  const pixelWidth = Math.round(rect.width * dpr)
-  const pixelHeight = Math.round(rect.height * dpr)
-  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+  const pixelWidth = Math.round(fireworkWidth * dpr)
+  const pixelHeight = Math.round(fireworkHeight * dpr)
+  const resized = canvas.width !== pixelWidth || canvas.height !== pixelHeight
+  if (resized) {
     canvas.width = pixelWidth
     canvas.height = pixelHeight
+    for (const firework of fireworks.value) firework.bounds = null
+    retiredFireworkBounds.length = 0
   }
   const ctx = canvas.getContext('2d')
   if (!ctx) return
   ctx.setTransform(canvas.width / 1920, 0, 0, canvas.height / 1980, 0, 0)
-  ctx.clearRect(0, 0, 1920, 1980)
+  // Fireworks occupy only a fraction of this high-DPI canvas. Erase their
+  // previous bounds instead of clearing nearly four million logical pixels.
+  ctx.globalCompositeOperation = 'source-over'
+  for (const bounds of retiredFireworkBounds) {
+    ctx.clearRect(bounds.x, bounds.y, bounds.width, bounds.height)
+  }
+  retiredFireworkBounds.length = 0
+  for (const firework of fireworks.value) {
+    if (!firework.bounds) continue
+    const { x, y, width, height } = firework.bounds
+    ctx.clearRect(x, y, width, height)
+  }
   ctx.globalCompositeOperation = 'lighter'
   let alive = false
 
@@ -255,10 +299,14 @@ function drawFireworks(now) {
     const age = now - firework.startedAt
     if (age >= firework.totalDuration) continue
     alive = true
+    const bounds = { left: Infinity, top: Infinity, right: -Infinity, bottom: -Infinity }
     const launchProgress = clamp(age / firework.launchDuration, 0, 1)
     if (launchProgress < 1) {
       const head = rocketPoint(firework, launchProgress)
       const trailProgress = Math.max(0, launchProgress - 0.5)
+      const trailStart = rocketPoint(firework, trailProgress)
+      includeFireworkPoint(bounds, head.x, head.y, 72)
+      includeFireworkPoint(bounds, trailStart.x, trailStart.y, 72)
       // 尾迹：分段渐细 + 闪烁，尾部还沿途洒落火星
       const segments = 22
       ctx.lineCap = 'round'
@@ -284,9 +332,12 @@ function drawFireworks(now) {
         const k = Math.random()
         const p = trailProgress + (launchProgress - trailProgress) * k
         const pt = rocketPoint(firework, p)
+        const sparkX = pt.x + range(-4, 4)
+        const sparkY = pt.y + range(-3, 3)
+        includeFireworkPoint(bounds, sparkX, sparkY, 32)
         ctx.globalAlpha = 0.6 * k * Math.random()
         ctx.beginPath()
-        ctx.arc(pt.x + range(-4, 4), pt.y + range(-3, 3), range(0.8, 2.4), 0, Math.PI * 2)
+        ctx.arc(sparkX, sparkY, range(0.8, 2.4), 0, Math.PI * 2)
         ctx.fillStyle = Math.random() < 0.5 ? '#fff3d6' : firework.colors[1]
         ctx.shadowBlur = 10
         ctx.fill()
@@ -308,6 +359,8 @@ function drawFireworks(now) {
         if (lifeProgress >= 1) continue
         const here = sparkPoint(firework, spark, burstAge)
         const before = sparkPoint(firework, spark, Math.max(0, burstAge - 0.15))
+        includeFireworkPoint(bounds, here.x, here.y, 72)
+        includeFireworkPoint(bounds, before.x, before.y, 72)
         const fade = (1 - lifeProgress) ** 1.25
         const twinkle = 0.65 + 0.35 * Math.sin(now / 72 + spark.phase) ** 2
         ctx.globalAlpha = fade * twinkle
@@ -328,11 +381,15 @@ function drawFireworks(now) {
       ctx.globalAlpha = 1
       ctx.shadowBlur = 0
     }
+    firework.bounds = finishFireworkBounds(bounds)
   }
   ctx.globalCompositeOperation = 'source-over'
   ctx.globalAlpha = 1
   ctx.shadowBlur = 0
-  fireworks.value = fireworks.value.filter((firework) => now - firework.startedAt < firework.totalDuration)
+  for (let index = fireworks.value.length - 1; index >= 0; index -= 1) {
+    const firework = fireworks.value[index]
+    if (now - firework.startedAt >= firework.totalDuration) fireworks.value.splice(index, 1)
+  }
   if (alive) fireworkFrame = requestAnimationFrame(drawFireworks)
 }
 
@@ -346,9 +403,9 @@ function sceneClick(event) {
 
 function scheduleAutomaticFirework() {
   window.clearTimeout(fireworkTimer)
-  if (!fireworkMounted || !fireworkNight.value) return
+  if (!fireworkMounted || !fireworkSceneVisible.value || document.hidden || !fireworkNight.value) return
   fireworkTimer = window.setTimeout(() => {
-    if (!fireworkNight.value) return
+    if (!fireworkNight.value || !fireworkSceneVisible.value || document.hidden) return
     const leftLane = Math.random() < 0.5
     const x = leftLane ? range(810, 900) : range(1220, 1770)
     launchFirework(x, range(1710, 1930), true)
@@ -356,13 +413,33 @@ function scheduleAutomaticFirework() {
   }, range(1900, 3900))
 }
 
+function syncSceneActivity() {
+  const active = fireworkSceneVisible.value && !document.hidden
+  if (active) {
+    motionSvg.value?.unpauseAnimations?.()
+    if (fireworkNight.value) scheduleAutomaticFirework()
+    if (fireworks.value.length && !fireworkFrame) {
+      fireworkFrame = requestAnimationFrame(drawFireworks)
+    }
+    return
+  }
+
+  motionSvg.value?.pauseAnimations?.()
+  window.clearTimeout(fireworkTimer)
+  fireworkTimer = 0
+  if (fireworkFrame) cancelAnimationFrame(fireworkFrame)
+  fireworkFrame = 0
+}
+
 watch(fireworkNight, (isNight) => {
   if (!fireworkMounted) return
-  if (isNight) {
+  if (isNight && fireworkSceneVisible.value && !document.hidden) {
     scheduleAutomaticFirework()
-  } else {
+  } else if (!isNight) {
     window.clearTimeout(fireworkTimer)
+    fireworkTimer = 0
     fireworks.value = []
+    retiredFireworkBounds.length = 0
     if (fireworkFrame) cancelAnimationFrame(fireworkFrame)
     fireworkFrame = 0
     const ctx = fireworkCanvas.value?.getContext('2d')
@@ -375,19 +452,38 @@ watch(fireworkNight, (isNight) => {
 
 onMounted(() => {
   fireworkMounted = true
-  scheduleAutomaticFirework()
+  fireworkVisibilityObserver = new IntersectionObserver((entries) => {
+    fireworkSceneVisible.value = Boolean(entries[0]?.isIntersecting)
+    syncSceneActivity()
+  }, { threshold: 0 })
+  if (sceneElement.value) fireworkVisibilityObserver.observe(sceneElement.value)
+
+  fireworkResizeObserver = new ResizeObserver((entries) => {
+    const size = entries[0]?.contentRect
+    if (!size) return
+    fireworkWidth = size.width
+    fireworkHeight = size.height
+  })
+  if (fireworkCanvas.value) fireworkResizeObserver.observe(fireworkCanvas.value)
+  document.addEventListener('visibilitychange', syncSceneActivity)
 })
 
 onUnmounted(() => {
   fireworkMounted = false
+  document.removeEventListener('visibilitychange', syncSceneActivity)
   window.clearTimeout(fireworkTimer)
   if (fireworkFrame) cancelAnimationFrame(fireworkFrame)
+  fireworkVisibilityObserver?.disconnect()
+  fireworkResizeObserver?.disconnect()
+  fireworkVisibilityObserver = null
+  fireworkResizeObserver = null
 })
 
 </script>
 
 <template>
   <div
+    ref="sceneElement"
     class="cloud-city-scene"
     :class="{ 'is-firework-night': fireworkNight }"
     :style="artStyle"
@@ -396,7 +492,7 @@ onUnmounted(() => {
   >
     <img class="city-base" :src="keyframeBlend.current" alt="" />
     <img class="city-frame-next" :src="keyframeBlend.next" :style="{ opacity: keyframeBlend.nextOpacity }" alt="" />
-    <svg class="city-motion" viewBox="0 0 1920 1980" preserveAspectRatio="none" aria-hidden="true">
+    <svg ref="motionSvg" class="city-motion" viewBox="0 0 1920 1980" preserveAspectRatio="none" aria-hidden="true">
       <defs>
         <filter id="droplet-glow" x="-200%" y="-200%" width="500%" height="500%">
           <feGaussianBlur stdDeviation="3" />

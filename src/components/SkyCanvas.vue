@@ -7,6 +7,26 @@ const BASE = import.meta.env.BASE_URL
 const canvas = ref(null)
 const COMETS_PER_HOUR = 10
 const COMET_HORIZON_ALTITUDE = -0.2 // 太阳完全落到地平线下后才出现
+const COMET_TAIL_SEGMENTS = 112
+const RIPPLE_POINTS = 80
+const RIPPLE_COS = new Float64Array(RIPPLE_POINTS)
+const RIPPLE_SIN = new Float64Array(RIPPLE_POINTS)
+const RIPPLE_TRIPLE_COS = new Float64Array(RIPPLE_POINTS)
+const RIPPLE_TRIPLE_SIN = new Float64Array(RIPPLE_POINTS)
+for (let point = 0; point < RIPPLE_POINTS; point++) {
+  const angle = (point / RIPPLE_POINTS) * Math.PI * 2
+  RIPPLE_COS[point] = Math.cos(angle)
+  RIPPLE_SIN[point] = Math.sin(angle)
+  RIPPLE_TRIPLE_COS[point] = Math.cos(angle * 3)
+  RIPPLE_TRIPLE_SIN[point] = Math.sin(angle * 3)
+}
+// Reused scratch space for the tail mesh. The comet is drawn synchronously on
+// one canvas, so these buffers can be shared by the main and split trails.
+const cometTailX = new Float64Array(COMET_TAIL_SEGMENTS + 1)
+const cometTailY = new Float64Array(COMET_TAIL_SEGMENTS + 1)
+const cometTailNormalX = new Float64Array(COMET_TAIL_SEGMENTS + 1)
+const cometTailNormalY = new Float64Array(COMET_TAIL_SEGMENTS + 1)
+const cometTailHalfWidth = new Float64Array(COMET_TAIL_SEGMENTS + 1)
 const COMET_PATHS = [
   { startX: 1.05, startY: -0.035, endX: 0.42, endY: 0.15, arc: 0.024, duration: 7.8 },
   { startX: -0.06, startY: -0.02, endX: 0.68, endY: 0.15, arc: -0.018, duration: 6.2 },
@@ -59,12 +79,20 @@ const PREVIEW_START_TIMESTAMP = PREVIEW_MODE
   : 0
 
 let ctx
+let backdropCanvas
+let backdropContext
+let backdropFrameKey = null
 let image
 let sceneImages = new Map()
+const pendingSceneImages = new Map()
+let neededSceneNames = new Set()
+let sceneImageLoadPromise = null
 let frameRect
 let raf = 0
 let timeInterval = 0
 let running = false
+let sceneVisible = false
+let sceneObserver = null
 let reducedMotion = false
 let width = 0
 let height = 0
@@ -82,6 +110,16 @@ let ripples = []
 let nextAmbientRippleAt = 0
 let grainCanvas
 let grainPattern
+let cloudPuffSprites = new Map()
+let cloudPuffPaletteKey = ''
+let cloudReflectionSprite = null
+let cloudReflectionColorKey = ''
+let lakeReflectionSprite = null
+const cometBranchProgressCache = new WeakMap()
+let cachedCometBranchPathIndex = null
+let cachedCometBranchMotion = null
+
+const quantizeCloudColor = (color) => color.map((channel) => Math.round(channel / 2) * 2)
 
 const mix = (a, b, t) => a + (b - a) * t
 
@@ -138,16 +176,90 @@ function drawCover(source) {
 
 function drawSceneAtTime(date) {
   const weights = sceneWeightsAt(date)
-  ctx.save()
-  ctx.globalCompositeOperation = 'lighter'
+  ensureSceneImages(weights)
+  let fallbackSource = image
   for (const [name, weight] of weights) {
-    if (weight < 0.001) continue
-    const source = sceneImages.get(name) || image
+    if (weight > 0 && sceneImages.has(name)) {
+      fallbackSource = touchSceneImage(name)
+      break
+    }
+  }
+
+  let baseSource = null
+  let accumulatedWeight = 0
+  for (const [name, weight] of weights) {
+    if (weight <= 0) continue
+    const source = touchSceneImage(name) || fallbackSource
     if (!source) continue
-    ctx.globalAlpha = weight
+    baseSource = source
+    accumulatedWeight = weight
+    break
+  }
+  if (!baseSource) baseSource = fallbackSource
+
+  ctx.save()
+  // The time-of-day plates are opaque RGB images with identical dimensions.
+  // Copying the first plate replaces last frame's pixels, so drawFrame no
+  // longer needs a separate full-screen clear before painting the scene.
+  ctx.globalCompositeOperation = 'copy'
+  ctx.globalAlpha = 1
+  if (baseSource) drawCover(baseSource)
+
+  // Source-over with a cumulative weight reproduces the same weighted RGB mix
+  // as the old lighter blend, while retaining the full opacity of the base.
+  let seenBase = false
+  for (const [name, weight] of weights) {
+    if (weight <= 0) continue
+    const source = touchSceneImage(name) || fallbackSource
+    if (!source) continue
+    if (!seenBase) {
+      seenBase = true
+      continue
+    }
+    const nextWeight = accumulatedWeight + weight
+    ctx.globalCompositeOperation = 'source-over'
+    ctx.globalAlpha = nextWeight > 0 ? weight / nextWeight : 0
     drawCover(source)
+    accumulatedWeight = nextWeight
   }
   ctx.restore()
+}
+
+function touchSceneImage(name) {
+  const source = sceneImages.get(name)
+  if (!source) return null
+  // Map insertion order doubles as a tiny LRU list for decoded image resources.
+  sceneImages.delete(name)
+  sceneImages.set(name, source)
+  return source
+}
+
+function trimSceneImageCache() {
+  const keep = new Set([...neededSceneNames, 'sunset'])
+  while (sceneImages.size > 4) {
+    const oldestUnused = [...sceneImages.keys()].find((name) => !keep.has(name))
+    if (!oldestUnused) break
+    sceneImages.delete(oldestUnused)
+  }
+}
+
+function ensureSceneImages(weights) {
+  neededSceneNames = new Set(weights.keys())
+  for (const name of neededSceneNames) {
+    if (sceneImages.has(name) || pendingSceneImages.has(name)) continue
+    const sourceUrl = SCENE_ASSETS[name]
+    if (!sourceUrl) continue
+    const request = loadImage(sourceUrl).then((source) => {
+      if (neededSceneNames.has(name)) {
+        const resolved = source || image
+        if (!resolved) return
+        sceneImages.set(name, resolved)
+        trimSceneImageCache()
+      }
+    }).finally(() => pendingSceneImages.delete(name))
+    pendingSceneImages.set(name, request)
+  }
+  trimSceneImageCache()
 }
 
 function currentSceneClock() {
@@ -260,14 +372,34 @@ function drawSun(solar) {
 }
 
 function drawCloudPuff(x, y, rx, ry, color, alpha) {
-  const gradient = ctx.createRadialGradient(x, y, 0, x, y, rx)
-  gradient.addColorStop(0, rgba(color, alpha))
-  gradient.addColorStop(0.58, rgba(color, alpha * 0.5))
-  gradient.addColorStop(1, rgba(color, 0))
-  ctx.fillStyle = gradient
-  ctx.beginPath()
-  ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2)
-  ctx.fill()
+  const ratio = ry / rx
+  const colorKey = color.join(',')
+  const key = `${colorKey}|${alpha}|${ratio.toFixed(3)}`
+  let sprite = cloudPuffSprites.get(key)
+  if (!sprite) {
+    // Cache the soft radial puff in local coordinates. Moving clouds then use
+    // image blits instead of rebuilding dozens of gradients on every frame.
+    const size = 512
+    const spriteHeight = Math.max(8, Math.round(size * ratio))
+    sprite = document.createElement('canvas')
+    sprite.width = size
+    sprite.height = spriteHeight
+    const spriteContext = sprite.getContext('2d')
+    const centerX = size / 2
+    const centerY = spriteHeight / 2
+    const radiusX = size / 2 - 1
+    const radiusY = spriteHeight / 2 - 1
+    const gradient = spriteContext.createRadialGradient(centerX, centerY, 0, centerX, centerY, radiusX)
+    gradient.addColorStop(0, rgba(color, alpha))
+    gradient.addColorStop(0.58, rgba(color, alpha * 0.5))
+    gradient.addColorStop(1, rgba(color, 0))
+    spriteContext.fillStyle = gradient
+    spriteContext.beginPath()
+    spriteContext.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, Math.PI * 2)
+    spriteContext.fill()
+    cloudPuffSprites.set(key, sprite)
+  }
+  ctx.drawImage(sprite, x - rx, y - ry, rx * 2, ry * 2)
 }
 
 function cloudPosition(cloud, seconds) {
@@ -292,6 +424,14 @@ function drawClouds(seconds, solar, moon) {
   const body = mixColor(mixColor([192, 211, 239], [163, 143, 183], warmLight), [94, 111, 158], nightLight)
   const highlight = mixColor(mixColor([250, 250, 255], [255, 215, 174], warmLight), [150, 177, 234], nightLight)
   const underside = mixColor(mixColor([76, 94, 137], [105, 77, 119], warmLight), [39, 52, 91], nightLight)
+  const cachedBody = quantizeCloudColor(body)
+  const cachedHighlight = quantizeCloudColor(highlight)
+  const cachedUnderside = quantizeCloudColor(underside)
+  const paletteKey = `${cachedBody}|${cachedHighlight}|${cachedUnderside}`
+  if (paletteKey !== cloudPuffPaletteKey) {
+    cloudPuffSprites.clear()
+    cloudPuffPaletteKey = paletteKey
+  }
   const cloudAlpha = clamp((0.15 + solar.daylight * 0.08 + solar.twilight * 0.06) * (1 - solar.night * 0.68 + moonLight * 0.16), 0.025, 0.24)
   for (const cloud of clouds) {
     const position = cloudPosition(cloud, seconds)
@@ -300,19 +440,19 @@ function drawClouds(seconds, solar, moon) {
     ctx.save()
     ctx.globalCompositeOperation = 'source-over'
     ctx.globalAlpha = cloudAlpha
-    drawCloudPuff(position.x, position.y + position.ry * 0.08, position.rx * 0.62, position.ry * 0.73, body, 0.32)
-    drawCloudPuff(position.x - position.rx * 0.31, position.y + position.ry * 0.02, position.rx * 0.4, position.ry * 0.62, body, 0.27)
-    drawCloudPuff(position.x + position.rx * 0.32, position.y - position.ry * 0.06, position.rx * 0.42, position.ry * 0.65, body, 0.3)
+    drawCloudPuff(position.x, position.y + position.ry * 0.08, position.rx * 0.62, position.ry * 0.73, cachedBody, 0.32)
+    drawCloudPuff(position.x - position.rx * 0.31, position.y + position.ry * 0.02, position.rx * 0.4, position.ry * 0.62, cachedBody, 0.27)
+    drawCloudPuff(position.x + position.rx * 0.32, position.y - position.ry * 0.06, position.rx * 0.42, position.ry * 0.65, cachedBody, 0.3)
     ctx.globalCompositeOperation = 'multiply'
     ctx.globalAlpha = cloudAlpha * 0.52
-    drawCloudPuff(position.x - lightDirection * position.rx * 0.08, position.y + position.ry * 0.28, position.rx * 0.58, position.ry * 0.52, underside, 0.42)
+    drawCloudPuff(position.x - lightDirection * position.rx * 0.08, position.y + position.ry * 0.28, position.rx * 0.58, position.ry * 0.52, cachedUnderside, 0.42)
     ctx.restore()
 
     ctx.save()
     ctx.globalCompositeOperation = 'screen'
     ctx.globalAlpha = cloudAlpha * (0.3 + solar.daylight * 0.7 + solar.twilight * 0.38 + moonLight * 0.22)
-    drawCloudPuff(position.x + position.rx * lightDirection * 0.22, position.y - position.ry * 0.3, position.rx * 0.34, position.ry * 0.42, highlight, 0.34)
-    drawCloudPuff(position.x + position.rx * lightDirection * 0.39, position.y - position.ry * 0.08, position.rx * 0.25, position.ry * 0.4, highlight, 0.25)
+    drawCloudPuff(position.x + position.rx * lightDirection * 0.22, position.y - position.ry * 0.3, position.rx * 0.34, position.ry * 0.42, cachedHighlight, 0.34)
+    drawCloudPuff(position.x + position.rx * lightDirection * 0.39, position.y - position.ry * 0.08, position.rx * 0.25, position.ry * 0.4, cachedHighlight, 0.25)
     ctx.restore()
   }
 }
@@ -320,6 +460,21 @@ function drawClouds(seconds, solar, moon) {
 function drawCloudReflections(seconds, solar, moon) {
   const warmLight = clamp(solar.twilight * 0.9, 0, 1)
   const reflectionColor = mixColor(mixColor([139, 177, 230], [255, 201, 153], warmLight), [102, 131, 193], solar.night * 0.78)
+  const cachedReflectionColor = quantizeCloudColor(reflectionColor)
+  const nextReflectionColorKey = cachedReflectionColor.join(',')
+  if (nextReflectionColorKey !== cloudReflectionColorKey) {
+    cloudReflectionColorKey = nextReflectionColorKey
+    cloudReflectionSprite = document.createElement('canvas')
+    cloudReflectionSprite.width = 256
+    cloudReflectionSprite.height = 4
+    const reflectionContext = cloudReflectionSprite.getContext('2d')
+    const reflectionGradient = reflectionContext.createLinearGradient(0, 0, 256, 0)
+    reflectionGradient.addColorStop(0, rgba(cachedReflectionColor, 0))
+    reflectionGradient.addColorStop(0.5, rgba(cachedReflectionColor, 1))
+    reflectionGradient.addColorStop(1, rgba(cachedReflectionColor, 0))
+    reflectionContext.fillStyle = reflectionGradient
+    reflectionContext.fillRect(0, 0, 256, 4)
+  }
   const moonLight = moon.illumination * smoothstep(-2, 12, moon.altitudeDegrees)
   const reflectionStrength = clamp(solar.daylight * 0.9 + solar.twilight * 0.65 + solar.night * moonLight * 0.45, 0, 1)
   ctx.save()
@@ -337,12 +492,8 @@ function drawCloudReflections(seconds, solar, moon) {
       const x = position.x + Math.sin(seconds * 0.33 + i + ripple * 0.8) * position.rx * 0.13
       const half = position.rx * (0.3 + (1 - spread) * 0.26) * (0.78 + 0.22 * Math.sin(i * 2 + ripple))
       const alpha = visibility * (1 - spread * 0.64)
-      const reflection = ctx.createLinearGradient(x - half, 0, x + half, 0)
-      reflection.addColorStop(0, rgba(reflectionColor, 0))
-      reflection.addColorStop(0.5, rgba(reflectionColor, alpha))
-      reflection.addColorStop(1, rgba(reflectionColor, 0))
-      ctx.fillStyle = reflection
-      ctx.fillRect(x - half, y, half * 2, Math.max(1, height * 0.0016))
+      ctx.globalAlpha = alpha
+      ctx.drawImage(cloudReflectionSprite, x - half, y, half * 2, Math.max(1, height * 0.0016))
     }
   }
   ctx.restore()
@@ -504,6 +655,18 @@ function drawLakeReflection(seconds, solar) {
   lakePath()
   ctx.clip()
   ctx.globalCompositeOperation = 'screen'
+  if (!lakeReflectionSprite) {
+    lakeReflectionSprite = document.createElement('canvas')
+    lakeReflectionSprite.width = 256
+    lakeReflectionSprite.height = 4
+    const reflectionContext = lakeReflectionSprite.getContext('2d')
+    const reflectionGradient = reflectionContext.createLinearGradient(0, 0, 256, 0)
+    reflectionGradient.addColorStop(0, 'rgba(255, 214, 156, 0)')
+    reflectionGradient.addColorStop(0.5, 'rgba(255, 223, 171, 1)')
+    reflectionGradient.addColorStop(1, 'rgba(255, 214, 156, 0)')
+    reflectionContext.fillStyle = reflectionGradient
+    reflectionContext.fillRect(0, 0, 256, 4)
+  }
   for (let i = 0; i < 27; i++) {
     const k = i / 26
     const y = mix(top, bottom, k)
@@ -512,13 +675,10 @@ function drawLakeReflection(seconds, solar) {
     // reads as a separate curved surface on the lake.
     const half = width * (0.006 + k * 0.022) * (0.82 + Math.sin(i * 2.31 + seconds) * 0.12)
     const alpha = strength * (1 - k * 0.58) * (0.58 + 0.42 * Math.sin(i * 1.83 + seconds * 0.7) ** 2)
-    const gradient = ctx.createLinearGradient(x + sway - half, 0, x + sway + half, 0)
-    gradient.addColorStop(0, rgba([255, 214, 156], 0))
-    gradient.addColorStop(0.5, rgba([255, 223, 171], alpha))
-    gradient.addColorStop(1, rgba([255, 214, 156], 0))
-    ctx.fillStyle = gradient
-    ctx.fillRect(x + sway - half, y, half * 2, Math.max(1, height * (0.0012 + k * 0.002)))
+    ctx.globalAlpha = alpha
+    ctx.drawImage(lakeReflectionSprite, x + sway - half, y, half * 2, Math.max(1, height * (0.0012 + k * 0.002)))
   }
+  ctx.globalAlpha = 1
 
   for (const shimmer of shimmerSeeds) {
     const y = frameRect.top + shimmer.y * frameRect.height
@@ -627,6 +787,8 @@ function drawRipples(solar) {
   const color = mixColor(mixColor([175, 211, 255], [255, 221, 177], solar.twilight), [140, 172, 238], solar.night * 0.72)
   ctx.save()
   ctx.globalCompositeOperation = 'screen'
+  // Precomputed unit-circle samples avoid hundreds of repeated trigonometric
+  // calls per frame while preserving the same ripple contours.
   for (const ripple of ripples) {
     const age = clamp((now - ripple.startedAt) / ripple.duration, 0, 1)
     const expansion = smoothstep(0, 1, age)
@@ -634,14 +796,18 @@ function drawRipples(solar) {
     const fade = (1 - age) ** 1.55 * fadeIn * ripple.strength
     const radius = height * (0.003 + expansion * ripple.maxRadius)
     const verticalScale = ripple.verticalScale || rippleVerticalScale(ripple.y)
+    const phase = ripple.phase + expansion * 1.3
+    const phaseSin = Math.sin(phase)
+    const phaseCos = Math.cos(phase)
     ctx.beginPath()
-    const points = 80
-    for (let point = 0; point <= points; point++) {
-      const angle = (point / points) * Math.PI * 2
-      const roughness = Math.sin(angle * 3 + ripple.phase + expansion * 1.3) * 0.006
+    for (let point = 0; point <= RIPPLE_POINTS; point++) {
+      const sample = point === RIPPLE_POINTS ? 0 : point
+      const roughness = (
+        RIPPLE_TRIPLE_SIN[sample] * phaseCos + RIPPLE_TRIPLE_COS[sample] * phaseSin
+      ) * 0.006
       const wave = radius * (1 + roughness)
-      const px = ripple.x + Math.cos(angle) * wave
-      const py = ripple.y + Math.sin(angle) * wave * verticalScale
+      const px = ripple.x + RIPPLE_COS[sample] * wave
+      const py = ripple.y + RIPPLE_SIN[sample] * wave * verticalScale
       if (point === 0) ctx.moveTo(px, py)
       else ctx.lineTo(px, py)
     }
@@ -692,6 +858,8 @@ function cometEventAt(secondsOfDay, dayIndex) {
 }
 
 function cometBranchProgress(path) {
+  const cachedProgress = cometBranchProgressCache.get(path)
+  if (cachedProgress !== undefined) return cachedProgress
   const visibleSplitY = Math.max(0.035, path.startY + 0.02)
   let low = 0
   let high = 1
@@ -700,7 +868,9 @@ function cometBranchProgress(path) {
     if (cometPositionAt(middle, path).y / height < visibleSplitY) low = middle
     else high = middle
   }
-  return clamp(high, 0.06, 0.84)
+  const progress = clamp(high, 0.06, 0.84)
+  cometBranchProgressCache.set(path, progress)
+  return progress
 }
 
 function cometColorAt(age) {
@@ -720,7 +890,55 @@ function cometBranchColorAt(age) {
   return mixColor([76, 83, 255], [255, 119, 74], (age - 0.76) / 0.24)
 }
 
+const COMET_TAIL_COLOR_STOP_POSITIONS = [0, 0.18, 0.46, 0.76, 0.94, 1]
+
+function makeCometTailColorStops(colorAt, alphaAt, tint = null, tintAmount = 0) {
+  return COMET_TAIL_COLOR_STOP_POSITIONS.map((position) => {
+    const amount = typeof tintAmount === 'function' ? tintAmount(position) : tintAmount
+    const color = tint ? mixColor(colorAt(position), tint, amount) : colorAt(position)
+    return { position, color: rgba(color, alphaAt(position)) }
+  })
+}
+
+// Tail color ramps are constant across frames; cache their CSS colors instead
+// of rebuilding dozens of RGB arrays and strings while the comet is visible.
+const COMET_MAIN_TAIL_LAYERS = [
+  {
+    widthScale: 3.8,
+    blur: 0.003,
+    colors: makeCometTailColorStops(cometColorAt, (age) => 0.045 + 0.125 * age ** 1.35, [218, 44, 210], 0.42),
+  },
+  {
+    widthScale: 1.32,
+    blur: 0.00075,
+    colors: makeCometTailColorStops(cometColorAt, (age) => 0.09 + 0.66 * age ** 1.08),
+  },
+  {
+    widthScale: 0.52,
+    blur: 0.0003,
+    colors: makeCometTailColorStops(cometColorAt, (age) => 0.025 + 0.72 * age ** 3.6, [244, 255, 255], (age) => 0.36 + age * 0.52),
+  },
+]
+const COMET_BRANCH_TAIL_LAYERS = [
+  {
+    widthScale: 3.8,
+    blur: 0.003,
+    colors: makeCometTailColorStops(cometBranchColorAt, (age) => 0.045 + 0.125 * age ** 1.35, [218, 44, 210], 0.42),
+  },
+  {
+    widthScale: 1.32,
+    blur: 0.00075,
+    colors: makeCometTailColorStops(cometBranchColorAt, (age) => 0.09 + 0.66 * age ** 1.08),
+  },
+  {
+    widthScale: 0.52,
+    blur: 0.0003,
+    colors: makeCometTailColorStops(cometBranchColorAt, (age) => 0.025 + 0.72 * age ** 3.6, [244, 255, 255], (age) => 0.36 + age * 0.52),
+  },
+]
+
 function cometBranchMotion(path, pathIndex, branchPoint) {
+  if (pathIndex === cachedCometBranchPathIndex) return cachedCometBranchMotion
   let side = cometEventRandom(pathIndex, 7) < 0.5 ? -1 : 1
   const roomInDirection = (direction) => direction > 0 ? 0.98 - path.endX : path.endX - 0.02
   if (roomInDirection(side) < 0.14) side *= -1
@@ -734,7 +952,9 @@ function cometBranchMotion(path, pathIndex, branchPoint) {
     0.075 + cometEventRandom(pathIndex, 9) * 0.035,
     verticalRoom / remaining,
   )
-  return { x: side * horizontalSpeed, y: verticalSpeed, turnDuration: 0.09 }
+  cachedCometBranchPathIndex = pathIndex
+  cachedCometBranchMotion = { x: side * horizontalSpeed, y: verticalSpeed, turnDuration: 0.09 }
+  return cachedCometBranchMotion
 }
 
 function cometBranchOffset(progress, branchPoint, speed, turnDuration) {
@@ -818,17 +1038,25 @@ function drawComet(date, solar, seconds) {
       const drawLength = Math.max(0, tailEnd - drawStart)
       if (drawLength <= 0.001) return
       const branchAlpha = branch ? branchSplitBrightness : primarySplitBrightness
-      const segments = 112
-      const points = Array.from({ length: segments + 1 }, (_, index) => {
+      const segments = COMET_TAIL_SEGMENTS
+      for (let index = 0; index <= segments; index++) {
         const age = index / segments
-        const t = drawStart + drawLength * age
-        return { ...cometPositionForBranch(t, path, branch, branchPoint, branchMotion), age }
-      })
-      const frames = points.map((point, index) => {
-        const before = points[Math.max(0, index - 1)]
-        const after = points[Math.min(points.length - 1, index + 1)]
-        const dx = after.x - before.x
-        const dy = after.y - before.y
+        const t = clamp(drawStart + drawLength * age, 0, 1)
+        let x = mix(width * path.startX, width * path.endX, t)
+        let y = mix(height * path.startY, height * path.endY, t) + 4 * t * (1 - t) * height * path.arc
+        if (branch) {
+          const offset = cometBranchOffset(t, branchPoint, branchMotion.x, branchMotion.turnDuration)
+          x += width * offset
+          y += height * cometBranchOffset(t, branchPoint, branchMotion.y, branchMotion.turnDuration)
+        }
+        cometTailX[index] = x
+        cometTailY[index] = y
+      }
+      for (let index = 0; index <= segments; index++) {
+        const beforeIndex = Math.max(0, index - 1)
+        const afterIndex = Math.min(segments, index + 1)
+        const dx = cometTailX[afterIndex] - cometTailX[beforeIndex]
+        const dy = cometTailY[afterIndex] - cometTailY[beforeIndex]
         const tangentLength = Math.hypot(dx, dy) || 1
         let nx = -dy / tangentLength
         let ny = dx / tangentLength
@@ -836,62 +1064,56 @@ function drawComet(date, solar, seconds) {
           nx *= -1
           ny *= -1
         }
-        return {
-          nx,
-          ny,
-          // 参考图的尾迹收得很窄：旧端近乎一条亮线，只在前端轻轻散开。
-          halfWidth: height * (0.00004 + 0.00205 * point.age ** 1.62)
-            * trailWidthScale * cometVisualScale * (branch ? 0.66 : 1),
-        }
-      })
+        cometTailNormalX[index] = nx
+        cometTailNormalY[index] = ny
+        // 参考图的尾迹收得很窄：旧端近乎一条亮线，只在前端轻轻散开。
+        cometTailHalfWidth[index] = height * (0.00004 + 0.00205 * (index / segments) ** 1.62)
+          * trailWidthScale * cometVisualScale * (branch ? 0.66 : 1)
+      }
 
       const traceRibbon = (widthScale) => {
-        const left = []
-        const right = []
-        points.forEach((point, index) => {
-          const { nx, ny, halfWidth } = frames[index]
-          const scaledHalfWidth = halfWidth * widthScale
-          left.push([point.x + nx * scaledHalfWidth, point.y + ny * scaledHalfWidth])
-          right.push([point.x - nx * scaledHalfWidth, point.y - ny * scaledHalfWidth])
-        })
         ctx.beginPath()
-        ctx.moveTo(left[0][0], left[0][1])
-        for (let index = 1; index < left.length; index++) ctx.lineTo(left[index][0], left[index][1])
-        for (let index = right.length - 1; index >= 0; index--) ctx.lineTo(right[index][0], right[index][1])
+        const firstWidth = cometTailHalfWidth[0] * widthScale
+        ctx.moveTo(
+          cometTailX[0] + cometTailNormalX[0] * firstWidth,
+          cometTailY[0] + cometTailNormalY[0] * firstWidth,
+        )
+        for (let index = 1; index <= segments; index++) {
+          const scaledHalfWidth = cometTailHalfWidth[index] * widthScale
+          ctx.lineTo(
+            cometTailX[index] + cometTailNormalX[index] * scaledHalfWidth,
+            cometTailY[index] + cometTailNormalY[index] * scaledHalfWidth,
+          )
+        }
+        for (let index = segments; index >= 0; index--) {
+          const scaledHalfWidth = cometTailHalfWidth[index] * widthScale
+          ctx.lineTo(
+            cometTailX[index] - cometTailNormalX[index] * scaledHalfWidth,
+            cometTailY[index] - cometTailNormalY[index] * scaledHalfWidth,
+          )
+        }
         ctx.closePath()
       }
 
-      const paintRibbon = (widthScale, alphaAt, colorAt, blur = 0) => {
-        traceRibbon(widthScale)
-        const rear = points[0]
-        const tip = points[points.length - 1]
-        const gradient = ctx.createLinearGradient(rear.x, rear.y, tip.x, tip.y)
-        const stops = [0, 0.18, 0.46, 0.76, 0.94, 1]
-        for (const age of stops) {
-          gradient.addColorStop(age, rgba(colorAt(age), alphaAt(age)))
+      const paintRibbon = (layer) => {
+        traceRibbon(layer.widthScale)
+        const gradient = ctx.createLinearGradient(
+          cometTailX[0], cometTailY[0],
+          cometTailX[segments], cometTailY[segments],
+        )
+        for (const stop of layer.colors) {
+          gradient.addColorStop(stop.position, stop.color)
         }
         ctx.globalAlpha = trailVisibility * trailFade * branchAlpha
-        ctx.filter = blur > 0 ? `blur(${Math.max(0.4, height * blur)}px)` : 'none'
+        ctx.filter = `blur(${Math.max(0.4, height * layer.blur * cometVisualScale)}px)`
         ctx.fillStyle = gradient
         ctx.fill()
       }
 
-      const tailColorAt = branch ? cometBranchColorAt : cometColorAt
       // 三层宽度刻意拉开：最外层只提供紫色气辉，中间层承载蓝青渐变，
       // 极细的亮芯让彗星读起来像一道划过天空的光，而不是一条粗色带。
-      paintRibbon(
-        3.8,
-        (age) => 0.045 + 0.125 * age ** 1.35,
-        (age) => mixColor(tailColorAt(age), [218, 44, 210], 0.42),
-        0.003 * cometVisualScale,
-      )
-      paintRibbon(1.32, (age) => 0.09 + 0.66 * age ** 1.08, tailColorAt, 0.00075 * cometVisualScale)
-      paintRibbon(
-        0.52,
-        (age) => 0.025 + 0.72 * age ** 3.6,
-        (age) => mixColor(tailColorAt(age), [244, 255, 255], 0.36 + age * 0.52),
-        0.0003 * cometVisualScale,
-      )
+      const layers = branch ? COMET_BRANCH_TAIL_LAYERS : COMET_MAIN_TAIL_LAYERS
+      for (const layer of layers) paintRibbon(layer)
     }
     drawTail()
     if (splitComet) drawTail(true)
@@ -1044,23 +1266,49 @@ function drawGrain(seconds) {
 }
 
 function drawFrame(date, seconds) {
-  if (!ctx || !image || !width || !height) return
-  ctx.clearRect(0, 0, width, height)
-  drawSceneAtTime(date)
+  if (!ctx || !backdropCanvas || !backdropContext || !image || !width || !height) return
   const solar = calculateSolarPosition(date)
   const moon = calculateMoonPosition(date, solar)
-  drawMovingSlopeLight(solar)
-  drawMoon(moon, solar)
-  drawClouds(seconds, solar, moon)
-  drawCloudReflections(seconds, solar, moon)
+  // The painted plates and broad slope light move imperceptibly at real-time
+  // speed. Cache them at 4 Hz; accelerated previews still refresh every frame.
+  const nextBackdropFrameKey = activeTimeScale > 1
+    ? date.getTime()
+    : Math.floor(date.getTime() / 250)
+  if (nextBackdropFrameKey !== backdropFrameKey) {
+    const frameContext = ctx
+    ctx = backdropContext
+    ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
+    drawSceneAtTime(date)
+    drawMovingSlopeLight(solar)
+    // These large, softly blurred layers move imperceptibly at real-time
+    // speed. Keep them in the cached plate instead of rasterizing them on
+    // every animation frame. Accelerated previews still refresh per frame.
+    drawMoon(moon, solar)
+    drawClouds(seconds, solar, moon)
+    drawCloudReflections(seconds, solar, moon)
+    drawSun(solar)
+    // The film-grain tile advances only a few pixels per second. Its position
+    // is effectively unchanged between these cached frames, so composite it
+    // here instead of blending a full-screen noise pass on every render.
+    if (!reducedMotion) drawGrain(seconds)
+    ctx = frameContext
+    backdropFrameKey = nextBackdropFrameKey
+  }
+
+  // Replacing the opaque backdrop also clears last frame's animated overlays.
+  ctx.save()
+  ctx.globalCompositeOperation = 'copy'
+  ctx.globalAlpha = 1
+  ctx.drawImage(backdropCanvas, 0, 0, width, height)
+  ctx.restore()
+
+  // Fast, small-area effects remain live at the scene frame rate.
   drawBirds(seconds, solar)
-  drawSun(solar)
   drawStars(seconds, solar)
   drawLakeReflection(seconds, solar)
   drawRipples(solar)
   drawComet(date, solar, seconds)
   drawVignette(solar)
-  if (!reducedMotion) drawGrain(seconds)
 }
 
 function seedDetails() {
@@ -1113,6 +1361,15 @@ function resize() {
   canvas.value.width = Math.round(width * pixelRatio)
   canvas.value.height = Math.round(height * pixelRatio)
   ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
+  if (!backdropCanvas) {
+    backdropCanvas = document.createElement('canvas')
+    backdropContext = backdropCanvas.getContext('2d', { alpha: false })
+  }
+  backdropCanvas.width = canvas.value.width
+  backdropCanvas.height = canvas.value.height
+  backdropContext.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0)
+  backdropFrameKey = null
+  cloudPuffSprites.clear()
   const clock = currentSceneClock()
   drawFrame(clock.date, clock.seconds)
 }
@@ -1146,9 +1403,9 @@ function advanceSceneClock() {
 function tick(now) {
   if (!running) return
   raf = requestAnimationFrame(tick)
-  const clock = advanceSceneClock()
   if (now - lastRender < 33) return
   lastRender = now
+  const clock = advanceSceneClock()
   drawFrame(clock.date, clock.seconds)
 }
 
@@ -1160,12 +1417,12 @@ function stopAnimation() {
 }
 
 function startAnimation() {
-  if (!image || document.hidden || running) return
+  if (!image || document.hidden || !sceneVisible || running) return
   running = true
-  lastClockWallTime = Date.now()
-  if (!PREVIEW_MODE) simulatedTimestamp = lastClockWallTime
-  else if (!simulatedTimestamp) simulatedTimestamp = PREVIEW_START_TIMESTAMP
-  simulatedSeconds = 0
+  if (!lastClockWallTime) {
+    lastClockWallTime = Date.now()
+    simulatedTimestamp = PREVIEW_MODE ? PREVIEW_START_TIMESTAMP : lastClockWallTime
+  }
   if (reducedMotion) {
     drawFrame(new Date(simulatedTimestamp), simulatedSeconds)
     timeInterval = window.setInterval(() => {
@@ -1178,9 +1435,34 @@ function startAnimation() {
   }
 }
 
+function startWhenReady() {
+  if (!sceneVisible || document.hidden) return
+  if (image) {
+    const clock = advanceSceneClock()
+    drawFrame(clock.date, clock.seconds)
+    startAnimation()
+    return
+  }
+  if (sceneImageLoadPromise) return
+  sceneImageLoadPromise = loadSceneImages().then(() => {
+    image = sceneImages.get('sunset') || sceneImages.values().next().value || null
+    if (!sceneVisible || document.hidden || !image) return
+    resize()
+    startAnimation()
+  }).finally(() => {
+    sceneImageLoadPromise = null
+  })
+}
+
 function onVisibilityChange() {
   if (document.hidden) stopAnimation()
-  else startAnimation()
+  else startWhenReady()
+}
+
+function onSceneVisibility(entries) {
+  sceneVisible = Boolean(entries[0]?.isIntersecting)
+  if (sceneVisible) startWhenReady()
+  else stopAnimation()
 }
 
 function loadImage(sourceUrl) {
@@ -1193,16 +1475,19 @@ function loadImage(sourceUrl) {
 }
 
 async function loadSceneImages() {
+  const initialWeights = sceneWeightsAt(currentSceneClock().date)
+  neededSceneNames = new Set(initialWeights.keys())
+  const initialNames = new Set([...neededSceneNames, 'sunset'])
   const loaded = await Promise.all(
-    Object.entries(SCENE_ASSETS).map(async ([name, sourceUrl]) => [name, await loadImage(sourceUrl)]),
+    [...initialNames].map(async (name) => [name, await loadImage(SCENE_ASSETS[name])]),
   )
-  const resolved = new Map(loaded)
-  let fallback = resolved.get('sunset')
-  if (!fallback) fallback = await loadImage(`${BASE}sky/crater-scene.png`)
-  for (const name of Object.keys(SCENE_ASSETS)) {
-    if (!resolved.get(name) && fallback) resolved.set(name, fallback)
+  const resolved = new Map(loaded.filter(([, source]) => source))
+  const fallback = resolved.get('sunset') || resolved.values().next().value || null
+  for (const name of neededSceneNames) {
+    if (!resolved.has(name) && fallback) resolved.set(name, fallback)
   }
   sceneImages = resolved
+  trimSceneImageCache()
   return fallback
 }
 
@@ -1218,9 +1503,8 @@ onMounted(async () => {
     simulatedTimestamp = PREVIEW_START_TIMESTAMP
     window.addEventListener('sky:preview-clock', onPreviewClock)
   }
-  image = await loadSceneImages()
-  resize()
-  if (image) startAnimation()
+  sceneObserver = new IntersectionObserver(onSceneVisibility, { threshold: 0 })
+  sceneObserver.observe(canvas.value)
 })
 
 onUnmounted(() => {
@@ -1229,6 +1513,14 @@ onUnmounted(() => {
   document.removeEventListener('visibilitychange', onVisibilityChange)
   window.removeEventListener('pointerdown', onLakePointerDown)
   window.removeEventListener('sky:preview-clock', onPreviewClock)
+  if (sceneObserver) sceneObserver.disconnect()
+  sceneObserver = null
+  if (backdropCanvas) {
+    backdropCanvas.width = 1
+    backdropCanvas.height = 1
+  }
+  backdropCanvas = null
+  backdropContext = null
 })
 </script>
 

@@ -5,18 +5,27 @@ import { onMounted, onUnmounted, ref } from 'vue'
 const canvas = ref(null)
 let ctx, raf
 let W, H, dpr
-let running = true
+let backingStoreReady = false
+let running = false
+let reducedMotion = false
 const particles = []
+const retiredParticles = []
 const MAX = 260
-const cursor = { x: -100, y: -100, sx: -100, sy: -100, active: false }
+const cursor = { x: -100, y: -100, sx: -100, sy: -100, active: false, haloDrawn: false, haloX: -100, haloY: -100 }
 let last = null
+const glowSprites = new Map()
 
 const rand = (a, b) => a + Math.random() * (b - a)
 
 function spawn(x, y, vx, vy) {
-  if (particles.length >= MAX) particles.shift()
+  if (particles.length >= MAX) {
+    const retired = particles.shift()
+    if (retired.wasDrawn) retiredParticles.push(retired)
+  }
   const angle = rand(0, Math.PI * 2)
   const speed = rand(0.05, 0.5)
+  const hue = rand(165, 190)
+  const sparkle = Math.random() > 0.85
   particles.push({
     x: x + rand(-2, 2),
     y: y + rand(-2, 2),
@@ -25,12 +34,20 @@ function spawn(x, y, vx, vy) {
     life: 0,
     max: rand(35, 70),
     size: rand(0.9, 2.4),
-    hue: rand(165, 190),
-    sparkle: Math.random() > 0.85,
+    hue,
+    sparkle,
+    glow: glowSprite(hue),
+    dotColor: `hsla(${hue}, 90%, 92%, 1)`,
+    sparkleColor: `hsla(${hue}, 90%, 88%, 1)`,
+    wasDrawn: false,
   })
 }
 
 function onPointerMove(e) {
+  if (!backingStoreReady) {
+    backingStoreReady = true
+    resize()
+  }
   const x = e.clientX
   const y = e.clientY
   cursor.x = x
@@ -51,6 +68,49 @@ function onPointerMove(e) {
     spawn(x, y, 0, 0)
   }
   last = { x, y }
+  ensureAnimation()
+}
+
+function ensureAnimation() {
+  if (reducedMotion || running || document.hidden || !ctx) return
+  running = true
+  raf = requestAnimationFrame(tick)
+}
+
+function onPointerLeave(event) {
+  // `pointerout` bubbles when moving between page elements; only stop at the viewport edge.
+  if (event.relatedTarget) return
+  cursor.active = false
+  last = null
+  if (particles.length) {
+    ensureAnimation()
+  } else if (ctx) {
+    if (cursor.haloDrawn) {
+      ctx.clearRect(cursor.haloX - 27, cursor.haloY - 27, 54, 54)
+      cursor.haloDrawn = false
+    }
+    releaseCanvasBackingStore()
+  }
+}
+
+function glowSprite(hue) {
+  const bucket = Math.round(hue / 5) * 5
+  if (glowSprites.has(bucket)) return glowSprites.get(bucket)
+
+  const size = 96
+  const center = size / 2
+  const sprite = document.createElement('canvas')
+  sprite.width = size
+  sprite.height = size
+  const spriteContext = sprite.getContext('2d')
+  const glow = spriteContext.createRadialGradient(center, center, 0, center, center, center - 4)
+  glow.addColorStop(0, `hsla(${bucket}, 85%, 82%, 1)`)
+  glow.addColorStop(0.4, `hsla(${bucket}, 80%, 66%, 0.5)`)
+  glow.addColorStop(1, `hsla(${bucket}, 80%, 60%, 0)`)
+  spriteContext.fillStyle = glow
+  spriteContext.fillRect(0, 0, size, size)
+  glowSprites.set(bucket, sprite)
+  return sprite
 }
 
 function drawCursorHalo() {
@@ -67,11 +127,45 @@ function drawCursorHalo() {
   ctx.arc(cursor.sx, cursor.sy, 26, 0, Math.PI * 2)
   ctx.fill()
   ctx.restore()
+  cursor.haloX = cursor.sx
+  cursor.haloY = cursor.sy
+  cursor.haloDrawn = true
+}
+
+function clearPreviousFrame() {
+  // Erase only pixels touched by last frame's particles and halo. The overlay
+  // remains transparent elsewhere, avoiding a full viewport clear per frame.
+  for (const p of particles) {
+    if (!p.wasDrawn) continue
+    const radius = p.previousBoundsRadius
+    ctx.clearRect(p.previousX - radius, p.previousY - radius, radius * 2, radius * 2)
+    p.wasDrawn = false
+  }
+  for (const p of retiredParticles) {
+    const radius = p.previousBoundsRadius
+    ctx.clearRect(p.previousX - radius, p.previousY - radius, radius * 2, radius * 2)
+  }
+  retiredParticles.length = 0
+  if (cursor.haloDrawn) {
+    ctx.clearRect(cursor.haloX - 27, cursor.haloY - 27, 54, 54)
+    cursor.haloDrawn = false
+  }
+}
+
+function releaseCanvasBackingStore() {
+  if (!canvas.value || !ctx || cursor.active || particles.length || !backingStoreReady) return
+  // Nothing is visible after the last particle has faded. Drop the full-window
+  // high-DPI backing store until the next pointer movement needs it again.
+  canvas.value.width = 1
+  canvas.value.height = 1
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  backingStoreReady = false
 }
 
 function tick() {
   if (!running) return
-  ctx.clearRect(0, 0, W, H)
+  raf = 0
+  clearPreviousFrame()
 
   ctx.save()
   ctx.globalCompositeOperation = 'lighter'
@@ -91,66 +185,77 @@ function tick() {
     const life = 1 - p.life / p.max
     const alpha = life * life * 0.85
     const radius = p.size * (0.6 + life * 0.8)
-    const glow = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, radius * 3.2)
-    glow.addColorStop(0, `hsla(${p.hue}, 85%, 82%, ${alpha})`)
-    glow.addColorStop(0.4, `hsla(${p.hue}, 80%, 66%, ${alpha * 0.5})`)
-    glow.addColorStop(1, `hsla(${p.hue}, 80%, 60%, 0)`)
-    ctx.fillStyle = glow
-    ctx.beginPath()
-    ctx.arc(p.x, p.y, radius * 3.2, 0, Math.PI * 2)
-    ctx.fill()
+    const glowRadius = radius * 3.2
+    ctx.globalAlpha = alpha
+    ctx.drawImage(p.glow, p.x - glowRadius, p.y - glowRadius, glowRadius * 2, glowRadius * 2)
 
-    ctx.fillStyle = `hsla(${p.hue}, 90%, 92%, ${alpha})`
+    ctx.fillStyle = p.dotColor
     ctx.beginPath()
     ctx.arc(p.x, p.y, radius * 0.7, 0, Math.PI * 2)
     ctx.fill()
 
+    let sparkleLength = 0
     if (p.sparkle && life > 0.4) {
-      const length = radius * 5 * life
-      ctx.strokeStyle = `hsla(${p.hue}, 90%, 88%, ${alpha * 0.5})`
+      sparkleLength = radius * 5 * life
+      ctx.globalAlpha = alpha * 0.5
+      ctx.strokeStyle = p.sparkleColor
       ctx.lineWidth = 0.8
       ctx.beginPath()
-      ctx.moveTo(p.x - length, p.y)
-      ctx.lineTo(p.x + length, p.y)
-      ctx.moveTo(p.x, p.y - length)
-      ctx.lineTo(p.x, p.y + length)
+      ctx.moveTo(p.x - sparkleLength, p.y)
+      ctx.lineTo(p.x + sparkleLength, p.y)
+      ctx.moveTo(p.x, p.y - sparkleLength)
+      ctx.lineTo(p.x, p.y + sparkleLength)
       ctx.stroke()
     }
+    p.previousX = p.x
+    p.previousY = p.y
+    p.previousBoundsRadius = Math.max(glowRadius, sparkleLength + 0.4)
+    p.wasDrawn = true
   }
   ctx.restore()
 
   drawCursorHalo()
-  raf = requestAnimationFrame(tick)
+  const cursorSettled = Math.abs(cursor.x - cursor.sx) < 0.15 && Math.abs(cursor.y - cursor.sy) < 0.15
+  if (particles.length || (cursor.active && !cursorSettled)) {
+    raf = requestAnimationFrame(tick)
+  } else {
+    running = false
+    releaseCanvasBackingStore()
+  }
 }
 
 function resize() {
+  if (!canvas.value || !ctx || !backingStoreReady) return
   dpr = Math.min(window.devicePixelRatio || 1, 2)
   W = window.innerWidth
   H = window.innerHeight
   canvas.value.width = W * dpr
   canvas.value.height = H * dpr
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+  for (const p of particles) p.wasDrawn = false
+  retiredParticles.length = 0
+  cursor.haloDrawn = false
+  if (particles.length || cursor.active) ensureAnimation()
 }
 
 function onVisibility() {
   if (document.hidden) {
     running = false
     cancelAnimationFrame(raf)
-  } else if (!running) {
-    running = true
-    raf = requestAnimationFrame(tick)
+    raf = 0
+  } else if (particles.length || cursor.active) {
+    ensureAnimation()
   }
 }
 
 onMounted(() => {
-  const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-  if (reduceMotion) return // 减少动态偏好的用户不启用
+  reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  if (reducedMotion) return // 减少动态偏好的用户不启用
   ctx = canvas.value.getContext('2d')
-  resize()
   window.addEventListener('resize', resize)
   window.addEventListener('pointermove', onPointerMove, { passive: true })
+  window.addEventListener('pointerout', onPointerLeave)
   document.addEventListener('visibilitychange', onVisibility)
-  raf = requestAnimationFrame(tick)
 })
 
 onUnmounted(() => {
@@ -158,6 +263,7 @@ onUnmounted(() => {
   cancelAnimationFrame(raf)
   window.removeEventListener('resize', resize)
   window.removeEventListener('pointermove', onPointerMove)
+  window.removeEventListener('pointerout', onPointerLeave)
   document.removeEventListener('visibilitychange', onVisibility)
 })
 </script>
